@@ -6,7 +6,7 @@ const OpenAI = require('openai');
 const app = express();
 app.use(express.json());
 
-// Configuration from environment variables
+// Configuration
 const FRESHCHAT_API_KEY = process.env.FRESHCHAT_API_KEY;
 const FRESHCHAT_API_URL = 'https://api.freshchat.com/v2';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -19,14 +19,19 @@ if (!FRESHCHAT_API_KEY || !OPENAI_API_KEY || !ASSISTANT_ID) {
   process.exit(1);
 }
 
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const openai = new OpenAI({ 
+  apiKey: OPENAI_API_KEY,
+  organization: process.env.OPENAI_ORG_ID, // Optional
+  project: process.env.OPENAI_PROJECT_ID  // Optional
+});
 
-// Store conversation threads in memory (use Redis/Database in production)
+// Store conversation threads
 const conversationThreads = new Map();
 
 // Logging helper
 function log(emoji, message, data = null) {
-  console.log(`${emoji} ${message}`);
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${emoji} ${message}`);
   if (data) console.log(JSON.stringify(data, null, 2));
 }
 
@@ -84,7 +89,6 @@ async function assignToHumanAgent(conversationId) {
 // Get response from OpenAI Assistant
 async function getAssistantResponse(userMessage, threadId = null) {
   try {
-    // Create new thread or use existing
     let thread;
     if (!threadId) {
       thread = await openai.beta.threads.create();
@@ -94,23 +98,20 @@ async function getAssistantResponse(userMessage, threadId = null) {
       log('♻️', `Using existing thread: ${threadId}`);
     }
 
-    // Add user message
     await openai.beta.threads.messages.create(thread.id, {
       role: 'user',
       content: userMessage
     });
 
-    // Run assistant
     const run = await openai.beta.threads.runs.create(thread.id, {
       assistant_id: ASSISTANT_ID
     });
 
     log('⏳', 'Waiting for assistant response...');
 
-    // Poll for completion
     let runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
     let attempts = 0;
-    const maxAttempts = 30; // 30 seconds timeout
+    const maxAttempts = 60; // Increased to 60 seconds
 
     while (runStatus.status !== 'completed' && attempts < maxAttempts) {
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -126,11 +127,9 @@ async function getAssistantResponse(userMessage, threadId = null) {
       throw new Error('Assistant response timeout');
     }
 
-    // Get assistant's response
     const messages = await openai.beta.threads.messages.list(thread.id);
     const assistantMessage = messages.data[0].content[0].text.value;
 
-    // Check for escalation
     const needsEscalation = assistantMessage.includes('ESCALATE_TO_HUMAN');
     
     let cleanMessage = assistantMessage;
@@ -140,7 +139,6 @@ async function getAssistantResponse(userMessage, threadId = null) {
       const match = assistantMessage.match(/ESCALATE_TO_HUMAN:\s*(.+)/);
       escalationReason = match ? match[1].trim() : 'User request';
       
-      // Remove escalation keyword from message
       cleanMessage = assistantMessage.replace(/ESCALATE_TO_HUMAN:.+/g, '').trim();
       
       if (!cleanMessage) {
@@ -166,12 +164,63 @@ async function getAssistantResponse(userMessage, threadId = null) {
   }
 }
 
-// Main webhook endpoint
+// Process message asynchronously (after responding to webhook)
+async function processMessageAsync(conversationId, messageContent) {
+  try {
+    log('🔄', `Processing message asynchronously for ${conversationId}`);
+
+    let threadId = conversationThreads.get(conversationId);
+
+    const { response, threadId: newThreadId, needsEscalation, escalationReason } = 
+      await getAssistantResponse(messageContent, threadId);
+
+    conversationThreads.set(conversationId, newThreadId);
+
+    await sendFreshchatMessage(conversationId, response);
+
+    if (needsEscalation) {
+      log('🚨', `Escalating: ${escalationReason}`);
+      await assignToHumanAgent(conversationId);
+      await sendFreshchatMessage(
+        conversationId, 
+        'A team member will be with you shortly. Thank you for your patience!'
+      );
+    }
+
+    log('✅', `Message processing completed for ${conversationId}`);
+
+  } catch (error) {
+    log('❌', `Error processing message for ${conversationId}:`, error.message);
+    
+    // Send error message to user
+    try {
+      await sendFreshchatMessage(
+        conversationId,
+        "I'm having trouble processing your request right now. Let me connect you with a human agent."
+      );
+      await assignToHumanAgent(conversationId);
+    } catch (fallbackError) {
+      log('❌', 'Failed to send error message:', fallbackError.message);
+    }
+  }
+}
+
+// Main webhook endpoint - RESPONDS IMMEDIATELY
 app.post('/freshchat-webhook', async (req, res) => {
   try {
-    log('📥', 'Webhook received');
+    // RESPOND IMMEDIATELY to avoid timeout (within 3 seconds)
+    res.status(200).json({ success: true, message: 'Webhook received' });
+    
+    log('📥', 'Webhook received and acknowledged');
     
     const { actor, action, data } = req.body;
+    
+    // Log webhook data for debugging
+    log('📋', 'Webhook details:', {
+      actor_type: actor?.actor_type,
+      action: action,
+      has_message: !!data?.message
+    });
     
     // Only process user messages
     if (action === 'message_create' && actor?.actor_type === 'user') {
@@ -181,51 +230,22 @@ app.post('/freshchat-webhook', async (req, res) => {
       
       if (!conversationId || !messageContent) {
         log('⚠️', 'Missing conversation ID or message content');
-        return res.status(200).json({ success: true, message: 'Invalid data' });
+        return;
       }
 
-      log('💬', `Message from ${conversationId}: ${messageContent}`);
+      log('💬', `User message in ${conversationId}: "${messageContent}"`);
 
-      // Get or create thread
-      let threadId = conversationThreads.get(conversationId);
-
-      // Get AI response
-      const { response, threadId: newThreadId, needsEscalation, escalationReason } = 
-        await getAssistantResponse(messageContent, threadId);
-
-      // Store thread ID
-      conversationThreads.set(conversationId, newThreadId);
-
-      // Send response to Freshchat
-      await sendFreshchatMessage(conversationId, response);
-
-      // Handle escalation
-      if (needsEscalation) {
-        log('🚨', `Escalating: ${escalationReason}`);
-        
-        // Escalate to human
-        await assignToHumanAgent(conversationId);
-        
-        // Send follow-up message
-        await sendFreshchatMessage(
-          conversationId, 
-          'A team member will be with you shortly. Thank you for your patience!'
-        );
-      }
-
-      return res.status(200).json({ success: true });
+      // Process message ASYNCHRONOUSLY (don't wait)
+      processMessageAsync(conversationId, messageContent)
+        .catch(err => log('❌', 'Async processing error:', err.message));
       
     } else {
-      // Not a user message
-      return res.status(200).json({ success: true, message: 'Not a user message' });
+      log('ℹ️', `Ignoring webhook: ${action} from ${actor?.actor_type}`);
     }
     
   } catch (error) {
     log('❌', 'Webhook error:', error.message);
-    return res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
+    // Already responded, so just log the error
   }
 });
 
@@ -234,7 +254,8 @@ app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    activeThreads: conversationThreads.size
   });
 });
 
@@ -242,32 +263,39 @@ app.get('/health', (req, res) => {
 app.get('/test', (req, res) => {
   res.status(200).json({
     status: 'Server running',
+    version: '1.0.0',
     config: {
       freshchat: !!FRESHCHAT_API_KEY,
       openai: !!OPENAI_API_KEY,
       assistant: !!ASSISTANT_ID
     },
-    activeThreads: conversationThreads.size
+    activeThreads: conversationThreads.size,
+    timestamp: new Date().toISOString()
   });
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
   res.status(200).json({
-    message: 'Freshchat-OpenAI Integration Server',
+    name: 'Freshchat-OpenAI Integration Server',
+    version: '1.0.0',
     endpoints: {
       webhook: 'POST /freshchat-webhook',
       health: 'GET /health',
       test: 'GET /test'
-    }
+    },
+    status: 'running'
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('\n🚀 Server started successfully!');
+  console.log('\n' + '='.repeat(60));
+  console.log('🚀 Freshchat-OpenAI Integration Server Started');
+  console.log('='.repeat(60));
   console.log(`📍 Port: ${PORT}`);
-  console.log(`🔗 Webhook URL: https://your-domain.com/freshchat-webhook`);
-  console.log(`❤️  Health: http://localhost:${PORT}/health`);
-  console.log(`🧪 Test: http://localhost:${PORT}/test\n`);
+  console.log(`🔗 Webhook: POST /freshchat-webhook`);
+  console.log(`❤️  Health: GET /health`);
+  console.log(`🧪 Test: GET /test`);
+  console.log('='.repeat(60) + '\n');
 });
