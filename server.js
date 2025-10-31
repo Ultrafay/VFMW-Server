@@ -42,16 +42,15 @@ async function sendFreshchatMessage(conversationId, message) {
     log('📝', `Message content: ${message.substring(0, 100)}...`);
     
     const payload = {
-      messages: [{
-        message_parts: [{
-          text: {
-            content: message
-          }
-        }],
-        message_type: 'normal',
-        actor_type: 'system'
-      }]
-    };
+  message_parts: [{
+    text: {
+      content: message
+    }
+  }],
+  message_type: 'normal',
+  actor_type: 'agent',  // Changed from 'system'
+  actor_id: process.env.FRESHCHAT_BOT_AGENT_ID  // Required!
+};
     
     log('📦', `Payload:`, payload);
     
