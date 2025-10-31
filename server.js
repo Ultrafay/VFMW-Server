@@ -38,16 +38,26 @@ function log(emoji, message, data = null) {
 // Send message to Freshchat
 async function sendFreshchatMessage(conversationId, message) {
   try {
+    log('📤', `Attempting to send message to conversation: ${conversationId}`);
+    log('📝', `Message content: ${message.substring(0, 100)}...`);
+    
+    const payload = {
+      messages: [{
+        message_parts: [{
+          text: {
+            content: message
+          }
+        }],
+        message_type: 'normal',
+        actor_type: 'system'
+      }]
+    };
+    
+    log('📦', `Payload:`, payload);
+    
     const response = await axios.post(
       `${FRESHCHAT_API_URL}/conversations/${conversationId}/messages`,
-      {
-        message_type: 'normal',
-        message_parts: [{
-          text: { content: message }
-        }],
-        actor_type: 'agent',
-        actor_id: 'bot'
-      },
+      payload,
       {
         headers: {
           'Authorization': `Bearer ${FRESHCHAT_API_KEY}`,
@@ -55,10 +65,56 @@ async function sendFreshchatMessage(conversationId, message) {
         }
       }
     );
-    log('✅', `Message sent to conversation ${conversationId}`);
+    
+    log('✅', `Message sent successfully to conversation ${conversationId}`);
+    log('📬', `Response:`, response.data);
     return response.data;
   } catch (error) {
-    log('❌', 'Error sending Freshchat message:', error.response?.data || error.message);
+    log('❌', `Error sending Freshchat message to ${conversationId}`);
+    log('❌', `Error status: ${error.response?.status}`);
+    log('❌', `Error data:`, error.response?.data);
+    log('❌', `Error message: ${error.message}`);
+    
+    // Try alternative format if first attempt fails
+    if (error.response?.status === 400) {
+      log('🔄', 'Trying alternative message format...');
+      return await sendFreshchatMessageAlt(conversationId, message);
+    }
+    
+    throw error;
+  }
+}
+
+// Alternative message format
+async function sendFreshchatMessageAlt(conversationId, message) {
+  try {
+    const payload = {
+      message_type: 'normal',
+      message_parts: [{
+        text: {
+          content: message
+        }
+      }],
+      actor_type: 'system'
+    };
+    
+    log('📦', `Alternative payload:`, payload);
+    
+    const response = await axios.post(
+      `${FRESHCHAT_API_URL}/conversations/${conversationId}/messages`,
+      payload,
+      {
+        headers: {
+          'Authorization': `Bearer ${FRESHCHAT_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    log('✅', `Message sent with alternative format`);
+    return response.data;
+  } catch (error) {
+    log('❌', `Alternative format also failed:`, error.response?.data);
     throw error;
   }
 }
